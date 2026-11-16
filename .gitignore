@@ -1,0 +1,14 @@
+/target/
+/.venv-txid/
+/for_model.zip
+/txid-node/
+**/vendor/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+.launch-count.json
+*.log
+*.bak*
