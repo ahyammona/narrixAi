@@ -16,12 +16,44 @@ use solana_sdk::{
     signature::{Keypair, Signature, Signer},
     transaction::Transaction,
 };
-use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::str::FromStr;
 use std::time::Duration;
 
 const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const SPL_ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const BONDING_CURVE_DISCRIMINATOR: [u8; 8] = [23, 183, 248, 55, 96, 216, 172, 96];
+const GLOBAL_DISCRIMINATOR: [u8; 8] = [167, 232, 232, 177, 200, 108, 114, 127];
+const GLOBAL_BUYBACK_RECIPIENTS_OFFSET: usize = 741;
+const DEVNET_MAX_BUY_LAMPORTS: u64 = 30_000_000;
+const DEVNET_SOL_RESERVE_LAMPORTS: u64 = 20_000_000;
+
+fn parse_bonding_curve_data(data: &[u8]) -> Result<(Pubkey, bool, u64, u64, u64, u64, u64)> {
+    if data.len() < 81 || data[..8] != BONDING_CURVE_DISCRIMINATOR {
+        return Err(PumpFunError::InvalidAccountData(
+            "Pump.fun bonding curve has an unsupported layout".to_string(),
+        ));
+    }
+
+    let read_u64 = |start: usize| -> Result<u64> {
+        let bytes = data
+            .get(start..start + 8)
+            .ok_or_else(|| PumpFunError::InvalidAccountData("Truncated bonding curve".into()))?;
+        Ok(u64::from_le_bytes(bytes.try_into()?))
+    };
+    let creator = Pubkey::try_from(&data[49..81])
+        .map_err(|_| PumpFunError::InvalidAccountData("Invalid bonding curve creator".into()))?;
+
+    Ok((
+        creator,
+        data[48] != 0,
+        read_u64(8)?,
+        read_u64(16)?,
+        read_u64(24)?,
+        read_u64(32)?,
+        read_u64(40)?,
+    ))
+}
 
 pub struct PumpFunClient {
     pub rpc_client: RpcClient,
@@ -220,19 +252,19 @@ impl PumpFunClient {
             &[b"bonding-curve", mint.as_ref()],
             &self.instruction_builder.program_id,
         );
-
-        let associated_bonding_curve = get_associated_token_address(&bonding_curve, mint);
-
+        let token_program = self.get_token_program(mint)?;
+        let associated_bonding_curve =
+            get_associated_token_address_with_program_id(&bonding_curve, mint, &token_program);
         let curve_account = self.rpc_client.get_account(&bonding_curve)?;
-
-        let creator_bytes = &curve_account.data[41..73];
-        let creator = Pubkey::try_from(creator_bytes)
-            .map_err(|_| PumpFunError::InvalidAccountData("Failed to parse creator".to_string()))?;
-
-        let complete = curve_account.data[8] != 0;
-        let virtual_token_reserves = u64::from_le_bytes(curve_account.data[9..17].try_into()?);
-        let virtual_sol_reserves = u64::from_le_bytes(curve_account.data[17..25].try_into()?);
-        let token_total_supply = u64::from_le_bytes(curve_account.data[25..33].try_into()?);
+        let (
+            creator,
+            complete,
+            virtual_token_reserves,
+            virtual_sol_reserves,
+            real_token_reserves,
+            real_sol_reserves,
+            token_total_supply,
+        ) = parse_bonding_curve_data(&curve_account.data)?;
 
         println!("✅ Pool found!");
         println!("   Bonding Curve: {}", bonding_curve);
@@ -254,10 +286,207 @@ impl PumpFunClient {
             creator,
             virtual_token_reserves,
             virtual_sol_reserves,
+            real_token_reserves,
+            real_sol_reserves,
             token_total_supply,
             complete,
             created_at: None,
         })
+    }
+
+    pub async fn buy_token_with_sol(
+        &self,
+        wallet: &Keypair,
+        mint: &Pubkey,
+        max_sol_cost: u64,
+    ) -> Result<TransactionResult> {
+        self.require_devnet_trading()?;
+        if max_sol_cost == 0 || max_sol_cost > DEVNET_MAX_BUY_LAMPORTS {
+            return Err(PumpFunError::Custom(
+                "Devnet buy amount must be between 1 lamport and 0.03 SOL".to_string(),
+            ));
+        }
+
+        let balance = self.rpc_client.get_balance(&wallet.pubkey())?;
+        if balance < max_sol_cost.saturating_add(DEVNET_SOL_RESERVE_LAMPORTS) {
+            return Err(PumpFunError::InsufficientBalance {
+                need: lamports_to_sol(max_sol_cost + DEVNET_SOL_RESERVE_LAMPORTS),
+                have: lamports_to_sol(balance),
+            });
+        }
+
+        let pool = self.get_pool_info(mint).await?;
+        if pool.complete {
+            return Err(PumpFunError::PoolComplete);
+        }
+        let token_program = self.get_token_program(mint)?;
+        let fee_recipient = self.get_fee_recipient()?;
+        let buyback_fee_recipient = self.get_buyback_fee_recipient()?;
+        // Pump.fun buys require the recipient ATA to exist before the instruction executes.
+        // Without this, the program can reject the transaction with a custom 3012 error.
+        let create_ata_ix =
+            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                &wallet.pubkey(),
+                &wallet.pubkey(),
+                mint,
+                &token_program,
+            );
+
+        // Leave headroom for protocol/creator fees so total SOL cost stays below max_sol_cost.
+        let curve_cost = u128::from(max_sol_cost) * 80 / 100;
+        let token_amount = curve_cost
+            .checked_mul(u128::from(pool.virtual_token_reserves))
+            .and_then(|value| value.checked_div(u128::from(pool.virtual_sol_reserves) + curve_cost))
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(PumpFunError::ArithmeticOverflow)?;
+        if token_amount == 0 {
+            return Err(PumpFunError::InsufficientLiquidity);
+        }
+
+        let instruction = self.instruction_builder.build_buy_instruction(
+            &wallet.pubkey(),
+            mint,
+            &pool.creator,
+            &token_program,
+            &fee_recipient,
+            &buyback_fee_recipient,
+            token_amount,
+            max_sol_cost,
+        )?;
+        let config = SwapConfig {
+            priority_fee_microlamports: Some(5_000),
+            compute_unit_limit: Some(400_000),
+            network: self.network,
+            slippage_bps: 2_000,
+            use_jito: false,
+        };
+        let instructions = vec![create_ata_ix, instruction];
+        self.send_transaction_with_signers(&[wallet], instructions, &config)
+            .await
+    }
+
+    pub async fn sell_all_tokens(
+        &self,
+        wallet: &Keypair,
+        mint: &Pubkey,
+    ) -> Result<Option<TransactionResult>> {
+        self.require_devnet_trading()?;
+        let token_program = self.get_token_program(mint)?;
+        let associated_user =
+            get_associated_token_address_with_program_id(&wallet.pubkey(), mint, &token_program);
+        let token_account = self
+            .rpc_client
+            .get_account_with_commitment(&associated_user, CommitmentConfig::confirmed())?
+            .value;
+        let Some(token_account) = token_account else {
+            return Ok(None);
+        };
+        if token_account.data.len() < 72 {
+            return Err(PumpFunError::InvalidAccountData(
+                "Token account is shorter than the SPL token account layout".to_string(),
+            ));
+        }
+        let amount = u64::from_le_bytes(token_account.data[64..72].try_into()?);
+        if amount == 0 {
+            return Ok(None);
+        }
+
+        let pool = self.get_pool_info(mint).await?;
+        if pool.complete {
+            return Err(PumpFunError::PoolComplete);
+        }
+        let fee_recipient = self.get_fee_recipient()?;
+        let buyback_fee_recipient = self.get_buyback_fee_recipient()?;
+        let expected_sol_output = u128::from(amount)
+            .checked_mul(u128::from(pool.virtual_sol_reserves))
+            .and_then(|value| {
+                value.checked_div(u128::from(pool.virtual_token_reserves) + u128::from(amount))
+            })
+            .and_then(|value| u64::try_from(value).ok())
+            .ok_or(PumpFunError::ArithmeticOverflow)?;
+        let min_sol_output = expected_sol_output.saturating_mul(80) / 100;
+
+        let instruction = self.instruction_builder.build_sell_instruction(
+            &wallet.pubkey(),
+            mint,
+            &pool.creator,
+            &token_program,
+            &fee_recipient,
+            &buyback_fee_recipient,
+            amount,
+            min_sol_output,
+        )?;
+        let config = SwapConfig {
+            priority_fee_microlamports: Some(5_000),
+            compute_unit_limit: Some(400_000),
+            network: self.network,
+            slippage_bps: 2_000,
+            use_jito: false,
+        };
+        self.send_transaction_with_signers(&[wallet], vec![instruction], &config)
+            .await
+            .map(Some)
+    }
+
+    fn get_token_program(&self, mint: &Pubkey) -> Result<Pubkey> {
+        let mint_account = self.rpc_client.get_account(mint)?;
+        if mint_account.owner != accounts::TOKEN_PROGRAM
+            && mint_account.owner.to_string() != SPL_TOKEN_2022_PROGRAM_ID
+        {
+            return Err(PumpFunError::InvalidAccountData(format!(
+                "Mint {mint} is owned by unsupported token program {}",
+                mint_account.owner
+            )));
+        }
+        Ok(mint_account.owner)
+    }
+
+    fn get_fee_recipient(&self) -> Result<Pubkey> {
+        let global = self
+            .rpc_client
+            .get_account(&self.instruction_builder.get_global_pda())?;
+        if global.data.len() < 73 || global.data[..8] != GLOBAL_DISCRIMINATOR {
+            return Err(PumpFunError::InvalidAccountData(
+                "Pump.fun global account has an unsupported layout".to_string(),
+            ));
+        }
+        Pubkey::try_from(&global.data[41..73])
+            .map_err(|_| PumpFunError::InvalidAccountData("Invalid fee recipient".to_string()))
+    }
+
+    fn get_buyback_fee_recipient(&self) -> Result<Pubkey> {
+        let global = self
+            .rpc_client
+            .get_account(&self.instruction_builder.get_global_pda())?;
+        let recipients_end = GLOBAL_BUYBACK_RECIPIENTS_OFFSET + 32;
+        if global.data.len() < recipients_end || global.data[..8] != GLOBAL_DISCRIMINATOR {
+            return Err(PumpFunError::InvalidAccountData(
+                "Pump.fun global account does not contain buyback fee configuration".to_string(),
+            ));
+        }
+
+        let recipient =
+            Pubkey::try_from(&global.data[GLOBAL_BUYBACK_RECIPIENTS_OFFSET..recipients_end])
+                .map_err(|_| {
+                    PumpFunError::InvalidAccountData(
+                        "Invalid Pump.fun buyback fee recipient".to_string(),
+                    )
+                })?;
+        if recipient == Pubkey::default() {
+            return Err(PumpFunError::InvalidAccountData(
+                "Pump.fun global account has no configured buyback fee recipient".to_string(),
+            ));
+        }
+        Ok(recipient)
+    }
+
+    fn require_devnet_trading(&self) -> Result<()> {
+        if self.network != Network::Devnet {
+            return Err(PumpFunError::Custom(
+                "Automatic buy/sell is enabled only on Devnet".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     // ==================== TRANSACTION HELPERS ====================
@@ -291,9 +520,9 @@ impl PumpFunClient {
 
         let simulation = self.rpc_client.simulate_transaction(&transaction)?;
         if let Some(err) = simulation.value.err {
+            let logs = simulation.value.logs.unwrap_or_default().join("\n");
             return Err(PumpFunError::TransactionFailed(format!(
-                "Simulation failed: {:?}",
-                err
+                "Simulation failed: {err:?}\n{logs}"
             )));
         }
 

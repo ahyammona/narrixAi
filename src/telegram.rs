@@ -1,10 +1,13 @@
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct TelegramNotifier {
     client: reqwest::Client,
     bot_token: String,
     chat_id: String,
+    activity: Option<Arc<Mutex<Option<String>>>>,
 }
 
 #[derive(Deserialize)]
@@ -32,8 +35,35 @@ impl TelegramNotifier {
                     .build()?,
                 bot_token,
                 chat_id,
+                activity: None,
             })),
         }
+    }
+
+    pub fn for_chat(bot_token: &str, chat_id: impl Into<String>) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            bot_token: bot_token.to_string(),
+            chat_id: chat_id.into(),
+            activity: None,
+        })
+    }
+
+    pub fn for_chat_with_activity(
+        bot_token: &str,
+        chat_id: impl Into<String>,
+        activity: Arc<Mutex<Option<String>>>,
+    ) -> Result<Self> {
+        Ok(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()?,
+            bot_token: bot_token.to_string(),
+            chat_id: chat_id.into(),
+            activity: Some(activity),
+        })
     }
 
     pub async fn send_message(&self, text: &str) -> Result<()> {
@@ -61,6 +91,12 @@ impl TelegramNotifier {
             .map_err(|_| anyhow!("Telegram returned an unreadable sendMessage response"))?;
         if !status.is_success() || !result.ok {
             anyhow::bail!("Telegram rejected sendMessage (HTTP {status})");
+        }
+        if let Some(activity) = &self.activity {
+            *activity
+                .lock()
+                .map_err(|_| anyhow!("Telegram activity state is poisoned"))? =
+                Some(text.to_string());
         }
         Ok(())
     }

@@ -2910,6 +2910,7 @@ dependencies = [
  "log",
  "rand 0.8.8",
  "reqwest",
+ "ring 0.17.14",
  "serde",
  "serde_json",
  "solana-client",

@@ -10,5 +10,9 @@ __pycache__/
 .env.*
 !.env.example
 .launch-count.json
+/.auto-sell-state.json*
+/.telegram-*-auto-sell-state.json*
+/.telegram-*-launch-count.json
+/.telegram-bot/
 *.log
 *.bak*

@@ -3,6 +3,6 @@ pub mod gemini;
 pub mod llm;
 pub mod store;
 
-pub use agent::run_agent;
+pub use agent::{run_agent, run_agent_with_wallet, AgentSchedule, AgentSettings};
 pub use llm::*;
 pub use store::*;

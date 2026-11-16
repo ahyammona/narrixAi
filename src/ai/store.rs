@@ -1,3 +1,4 @@
+use crate::types::{Pair, PoolMetrics};
 use anyhow::{anyhow, bail, Result};
 use std::collections::VecDeque;
 
@@ -13,6 +14,10 @@ pub struct TokenRecord {
     pub image: String,
     /// Public metadata JSON URI used when launching this token.
     pub metadata_uri: String,
+    pub source_pair: Option<Pair>,
+    pub source_pool: Option<PoolMetrics>,
+    pub source_quality: Option<String>,
+    pub source_quality_reason: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -34,6 +39,10 @@ impl TokenDb {
         image: &str,
         metadata_uri: &str,
         source_mint: Option<&str>,
+        source_pair: Option<Pair>,
+        source_pool: Option<PoolMetrics>,
+        source_quality: Option<String>,
+        source_quality_reason: Option<String>,
     ) -> Result<(TokenRecord, Option<TokenRecord>)> {
         let name = name.trim();
         let symbol = symbol.trim().to_uppercase();
@@ -58,6 +67,10 @@ impl TokenDb {
             symbol,
             image: image.trim().to_string(),
             metadata_uri: metadata_uri.trim().to_string(),
+            source_pair,
+            source_pool,
+            source_quality,
+            source_quality_reason,
         };
         self.tokens.push_back(record.clone());
         Ok((record, evicted))
@@ -111,6 +124,10 @@ mod tests {
                 "https://example.com/image.png",
                 "https://example.com/metadata.json",
                 Some("Mint111"),
+                None,
+                None,
+                None,
+                None,
             )
             .unwrap();
 

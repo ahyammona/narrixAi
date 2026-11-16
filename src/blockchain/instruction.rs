@@ -13,9 +13,12 @@ const TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const MPL_TOKEN_METADATA_PROGRAM_ID: &str = "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s";
 const MAYHEM_PROGRAM_ID: &str = "MAyhSmzXzV1pTf7LsNkrNwkWKTo4ougAJ1PPg47MD4e";
+const FEE_PROGRAM_ID: &str = "pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ";
 
 const CREATE_DISCRIMINATOR: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
 const CREATE_V2_DISCRIMINATOR: [u8; 8] = [0xd6, 0x90, 0x4c, 0xec, 0x5f, 0x8b, 0x31, 0xb4];
+const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
 pub struct PumpInstructionBuilder {
     pub program_id: Pubkey,
@@ -78,6 +81,130 @@ impl PumpInstructionBuilder {
 
     pub fn get_event_authority_pda(&self) -> Pubkey {
         Pubkey::find_program_address(&[b"__event_authority"], &self.program_id).0
+    }
+
+    pub fn build_buy_instruction(
+        &self,
+        user: &Pubkey,
+        mint: &Pubkey,
+        creator: &Pubkey,
+        token_program: &Pubkey,
+        fee_recipient: &Pubkey,
+        buyback_fee_recipient: &Pubkey,
+        amount: u64,
+        max_sol_cost: u64,
+    ) -> Result<Instruction> {
+        let bonding_curve = self.get_bonding_curve_pda(mint);
+        let associated_bonding_curve =
+            get_associated_token_address_with_program_id(&bonding_curve, mint, token_program);
+        let associated_user =
+            get_associated_token_address_with_program_id(user, mint, token_program);
+        let creator_vault =
+            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &self.program_id).0;
+        let global_volume_accumulator =
+            Pubkey::find_program_address(&[b"global_volume_accumulator"], &self.program_id).0;
+        let user_volume_accumulator = Pubkey::find_program_address(
+            &[b"user_volume_accumulator", user.as_ref()],
+            &self.program_id,
+        )
+        .0;
+        let fee_program = Pubkey::from_str(FEE_PROGRAM_ID)
+            .map_err(|error| crate::error::PumpFunError::InvalidPubkey(error.to_string()))?;
+        let fee_config =
+            Pubkey::find_program_address(&[b"fee_config", self.program_id.as_ref()], &fee_program)
+                .0;
+        let bonding_curve_v2 =
+            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &self.program_id).0;
+
+        let mut data = Vec::with_capacity(26);
+        data.extend_from_slice(&BUY_DISCRIMINATOR);
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&max_sol_cost.to_le_bytes());
+        data.extend_from_slice(&[0, 0]);
+
+        let mut accounts = vec![
+            AccountMeta::new_readonly(self.get_global_pda(), false),
+            AccountMeta::new(*fee_recipient, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(associated_bonding_curve, false),
+            AccountMeta::new(associated_user, false),
+            AccountMeta::new(*user, true),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new(creator_vault, false),
+            AccountMeta::new_readonly(self.get_event_authority_pda(), false),
+            AccountMeta::new_readonly(self.program_id, false),
+            AccountMeta::new_readonly(global_volume_accumulator, false),
+            AccountMeta::new(user_volume_accumulator, false),
+            AccountMeta::new_readonly(fee_config, false),
+            AccountMeta::new_readonly(fee_program, false),
+        ];
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
+        accounts.push(AccountMeta::new(*buyback_fee_recipient, false));
+
+        Ok(Instruction {
+            program_id: self.program_id,
+            accounts,
+            data,
+        })
+    }
+
+    pub fn build_sell_instruction(
+        &self,
+        user: &Pubkey,
+        mint: &Pubkey,
+        creator: &Pubkey,
+        token_program: &Pubkey,
+        fee_recipient: &Pubkey,
+        buyback_fee_recipient: &Pubkey,
+        amount: u64,
+        min_sol_output: u64,
+    ) -> Result<Instruction> {
+        let bonding_curve = self.get_bonding_curve_pda(mint);
+        let associated_bonding_curve =
+            get_associated_token_address_with_program_id(&bonding_curve, mint, token_program);
+        let associated_user =
+            get_associated_token_address_with_program_id(user, mint, token_program);
+        let creator_vault =
+            Pubkey::find_program_address(&[b"creator-vault", creator.as_ref()], &self.program_id).0;
+        let fee_program = Pubkey::from_str(FEE_PROGRAM_ID)
+            .map_err(|error| crate::error::PumpFunError::InvalidPubkey(error.to_string()))?;
+        let fee_config =
+            Pubkey::find_program_address(&[b"fee_config", self.program_id.as_ref()], &fee_program)
+                .0;
+        let bonding_curve_v2 =
+            Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &self.program_id).0;
+
+        let mut data = Vec::with_capacity(24);
+        data.extend_from_slice(&SELL_DISCRIMINATOR);
+        data.extend_from_slice(&amount.to_le_bytes());
+        data.extend_from_slice(&min_sol_output.to_le_bytes());
+
+        let mut accounts = vec![
+            AccountMeta::new_readonly(self.get_global_pda(), false),
+            AccountMeta::new(*fee_recipient, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new(bonding_curve, false),
+            AccountMeta::new(associated_bonding_curve, false),
+            AccountMeta::new(associated_user, false),
+            AccountMeta::new(*user, true),
+            AccountMeta::new_readonly(system_program::id(), false),
+            AccountMeta::new(creator_vault, false),
+            AccountMeta::new_readonly(*token_program, false),
+            AccountMeta::new_readonly(self.get_event_authority_pda(), false),
+            AccountMeta::new_readonly(self.program_id, false),
+            AccountMeta::new_readonly(fee_config, false),
+            AccountMeta::new_readonly(fee_program, false),
+        ];
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
+        accounts.push(AccountMeta::new(*buyback_fee_recipient, false));
+
+        Ok(Instruction {
+            program_id: self.program_id,
+            accounts,
+            data,
+        })
     }
 
     pub fn get_metadata_pda(&self, mint: &Pubkey) -> Pubkey {

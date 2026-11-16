@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod logic;
 mod telegram;
+mod telegram_bot;
 mod types;
 mod x;
 
@@ -30,6 +31,19 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().map_err(|error| {
         anyhow::anyhow!("Failed to load .env from the current directory: {error}")
     })?;
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => {}
+        [arg] if arg == "--telegram-bot" => {
+            let bot = telegram_bot::TelegramBot::from_env().await?;
+            return tokio::task::LocalSet::new().run_until(bot.run()).await;
+        }
+        _ => anyhow::bail!(
+            "Unknown argument(s): {}. Use --telegram-bot to start the Telegram control bot.",
+            args.join(" ")
+        ),
+    }
 
     let launch_network = prompt_for_launch_network()?;
 

@@ -1,9 +1,13 @@
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use solana_sdk::signature::Keypair;
 use std::collections::{HashMap, HashSet};
 use tokio::{
-    sync::mpsc::{self, UnboundedSender},
+    sync::{
+        mpsc::{self, UnboundedSender},
+        watch,
+    },
     task::JoinHandle,
 };
 use xplore::Xplore;
@@ -12,7 +16,11 @@ use super::gemini::generate_json_text;
 use super::store::{TokenDb, TokenRecord};
 use crate::{
     blockchain::stream_data_to_channel,
-    logic::{create_token_flow, search_on_x, stream_endpoints},
+    blockchain::utils::load_keypair_from_env,
+    logic::{
+        create_token_flow, devnet_wallet_balance_sol, search_on_x, sell_all_devnet_tokens,
+        stream_endpoints,
+    },
     telegram::TelegramNotifier,
     types::{Pair, PoolMetrics, Trade},
 };
@@ -24,11 +32,24 @@ const DAILY_LAUNCH_TARGET_MIN: u32 = 10;
 const DAILY_LAUNCH_TARGET_MAX: u32 = 25;
 const DAILY_LAUNCH_STATE_FILE: &str = ".launch-count.json";
 const DEVNET_TEST_METADATA_URI: &str = "https://invalid.local/custody-alias-sibling.json";
+const AUTO_SELL_STATE_FILE: &str = ".auto-sell-state.json";
+const DEVNET_MAX_BUY_SOL: f64 = 0.03;
+const DEVNET_SOL_RESERVE: f64 = 0.02;
+const MAX_HOLD_SECS: u64 = 24 * 60 * 60;
+const AUTO_SELL_RETRY_SECS: u64 = 30;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct DailyLaunchCount {
     utc_day: u64,
     successful_launches: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PendingSell {
+    mint: String,
+    due_at_unix_secs: u64,
+    #[serde(default)]
+    retry_attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,9 +90,14 @@ struct ModelDecision {
     suggested_symbol: Option<String>,
     #[serde(default)]
     suggested_narrative: Option<String>,
+    #[serde(default)]
+    buy_amount_sol: Option<f64>,
+    #[serde(default)]
+    sell_after_seconds: Option<u64>,
 }
 
 struct AgentState {
+    state_id: Option<String>,
     tokens: TokenDb,
     token_memory: HashMap<String, RememberedTokenData>,
     launched_ids: HashSet<u64>,
@@ -87,6 +113,7 @@ struct AgentState {
     decision_pending: bool,
     launch_day: u64,
     successful_launches_today: u32,
+    pending_sells: Vec<PendingSell>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +127,7 @@ struct RememberedTokenData {
 impl Default for AgentState {
     fn default() -> Self {
         Self {
+            state_id: None,
             tokens: TokenDb::new(),
             token_memory: HashMap::new(),
             launched_ids: HashSet::new(),
@@ -115,6 +143,7 @@ impl Default for AgentState {
             decision_pending: true,
             launch_day: utc_day_number(),
             successful_launches_today: 0,
+            pending_sells: Vec::new(),
         }
     }
 }
@@ -126,14 +155,80 @@ pub async fn run_agent(
     launch_network: &str,
     telegram: Option<&TelegramNotifier>,
 ) -> Result<()> {
+    let wallet = load_keypair_from_env("PRIVATE_KEY")?;
+    let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+    run_agent_with_wallet(
+        &wallet,
+        gemini_api_key,
+        groq_api_key,
+        xplore,
+        launch_network,
+        telegram,
+        AgentSchedule::AutoPilot,
+        None,
+        AgentSettings::default(),
+        None,
+        shutdown_rx,
+        true,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSchedule {
+    AutoPilot,
+    Interval,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AgentSettings {
+    pub max_buy_sol: f64,
+    pub max_hold_secs: u64,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            max_buy_sol: DEVNET_MAX_BUY_SOL,
+            max_hold_secs: MAX_HOLD_SECS,
+        }
+    }
+}
+
+pub async fn run_agent_with_wallet(
+    wallet: &Keypair,
+    gemini_api_key: &str,
+    groq_api_key: Option<&str>,
+    xplore: &mut Xplore,
+    launch_network: &str,
+    telegram: Option<&TelegramNotifier>,
+    schedule: AgentSchedule,
+    interval_secs: Option<u64>,
+    settings: AgentSettings,
+    state_id: Option<String>,
+    mut shutdown: watch::Receiver<bool>,
+    listen_for_ctrl_c: bool,
+) -> Result<()> {
     let (rpc_url, wss_url) = stream_endpoints();
     let (trade_sender, mut trade_receiver) = mpsc::channel(64);
     let (stream_status_sender, mut stream_status_receiver) = mpsc::unbounded_channel();
     let mut state = AgentState::default();
-    let (launch_day, successful_launches_today) = load_daily_launch_count()?;
+    state.state_id = state_id;
+    let launch_count_path = state_file_path(DAILY_LAUNCH_STATE_FILE, state.state_id.as_deref());
+    let pending_sells_path = state_file_path(AUTO_SELL_STATE_FILE, state.state_id.as_deref());
+    let (launch_day, successful_launches_today) = load_daily_launch_count(&launch_count_path)?;
     state.launch_day = launch_day;
     state.successful_launches_today = successful_launches_today;
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(DECISION_INTERVAL_SECS));
+    state.pending_sells = load_pending_sells(&pending_sells_path)?;
+    let decision_interval = match schedule {
+        AgentSchedule::AutoPilot => DECISION_INTERVAL_SECS,
+        AgentSchedule::Interval => interval_secs
+            .filter(|seconds| *seconds >= MIN_DECISION_INTERVAL_SECS)
+            .ok_or_else(|| {
+                anyhow!("scheduled interval must be at least {MIN_DECISION_INTERVAL_SECS} seconds")
+            })?,
+    };
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(decision_interval));
 
     start_ingress_task(
         &mut state,
@@ -145,6 +240,8 @@ pub async fn run_agent(
     run_turn(
         gemini_api_key,
         groq_api_key,
+        wallet,
+        &settings,
         xplore,
         launch_network,
         &rpc_url,
@@ -161,7 +258,14 @@ pub async fn run_agent(
     println!("AI agent started. Ingress may be paused briefly by the AI.");
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
+        changed = shutdown.changed() => {
+            if changed.is_err() || *shutdown.borrow() {
+                stop_ingress(&mut state).await;
+                println!("AI agent stopped.");
+                return Ok(());
+            }
+        }
+        signal = tokio::signal::ctrl_c(), if listen_for_ctrl_c => {
                 signal?;
                 stop_ingress(&mut state).await;
                 println!("AI agent stopped.");
@@ -173,7 +277,7 @@ pub async fn run_agent(
                     let needs_x_fallback = trade.pair.as_ref().map_or(true, Vec::is_empty);
                     let ingress = remember_ingress(&trade, &mut state);
                     state.current_ingress = Some(ingress);
-                    state.decision_pending = true;
+                    state.decision_pending = schedule == AgentSchedule::AutoPilot;
                     let ingress_name = state
                         .current_ingress
                         .as_ref()
@@ -198,19 +302,23 @@ pub async fn run_agent(
                             state.latest_token_research = Some(result);
                         }
                     }
-                    run_turn(
-                        gemini_api_key,
-                        groq_api_key,
-                        xplore,
-                        launch_network,
-                        &rpc_url,
-                        &wss_url,
-                        &trade_sender,
-                        &stream_status_sender,
-                        &mut state,
-                        "new ingress",
-                        telegram,
-                    ).await?;
+                    if schedule == AgentSchedule::AutoPilot {
+                        run_turn(
+                            gemini_api_key,
+                            groq_api_key,
+                            wallet,
+                            &settings,
+                            xplore,
+                            launch_network,
+                            &rpc_url,
+                            &wss_url,
+                            &trade_sender,
+                            &stream_status_sender,
+                            &mut state,
+                            "new ingress",
+                            telegram,
+                        ).await?;
+                    }
                     if state.stream_task.is_none() {
                         discard_queued_trades(&mut trade_receiver);
                     }
@@ -220,6 +328,8 @@ pub async fn run_agent(
                 run_turn(
                     gemini_api_key,
                     groq_api_key,
+                    wallet,
+                    &settings,
                     xplore,
                     launch_network,
                     &rpc_url,
@@ -230,6 +340,9 @@ pub async fn run_agent(
                     "pending decision",
                     telegram,
                 ).await?;
+            }
+            _ = wait_until_auto_sell_due(next_auto_sell_due(&state.pending_sells)), if !state.pending_sells.is_empty() => {
+                process_due_auto_sells(wallet, &mut state, telegram).await?;
             }
             status = stream_status_receiver.recv(), if state.stream_task.is_some() => {
                 match status {
@@ -271,6 +384,8 @@ pub async fn run_agent(
                 run_turn(
                     gemini_api_key,
                     groq_api_key,
+                    wallet,
+                    &settings,
                     xplore,
                     launch_network,
                     &rpc_url,
@@ -292,6 +407,8 @@ pub async fn run_agent(
 async fn run_turn(
     gemini_api_key: &str,
     groq_api_key: Option<&str>,
+    wallet: &Keypair,
+    settings: &AgentSettings,
     xplore: &mut Xplore,
     launch_network: &str,
     rpc_url: &str,
@@ -310,17 +427,25 @@ async fn run_turn(
 
     state.last_decision_at = Some(now);
     for _ in 0..3 {
-        let decision =
-            match request_decision(gemini_api_key, groq_api_key, launch_network, state).await {
-                Ok(decision) => decision,
-                Err(error) => {
-                    eprintln!(
-                        "⚠️  AI decision request failed during {trigger}: {error}. \
+        let decision = match request_decision(
+            gemini_api_key,
+            groq_api_key,
+            wallet,
+            settings,
+            launch_network,
+            state,
+        )
+        .await
+        {
+            Ok(decision) => decision,
+            Err(error) => {
+                eprintln!(
+                    "⚠️  AI decision request failed during {trigger}: {error}. \
                      Keeping ingress active; the agent will retry on its next decision cycle."
-                    );
-                    return Ok(());
-                }
-            };
+                );
+                return Ok(());
+            }
+        };
         state.decision_pending = false;
         report_token_assessment(state, &decision);
         println!(
@@ -406,6 +531,10 @@ async fn run_turn(
                     ingress.image_uri.as_deref().unwrap_or_default(),
                     ingress.metadata_uri.as_deref().unwrap_or_default(),
                     Some(&ingress.mint),
+                    ingress.dexscreener.clone(),
+                    Some(ingress.pool.clone()),
+                    decision.token_quality.clone(),
+                    decision.token_quality_reason.clone(),
                 )?;
                 println!(
                     "AI save values:\n  source mint: {}\n  name: {}\n  symbol: {}\n  image URI: {:?}\n  metadata URI: {:?}\n  saved token ID: {}",
@@ -467,11 +596,107 @@ async fn run_turn(
                     token.metadata_uri,
                     metadata_uri
                 );
-                let mint =
-                    launch_saved_token(launch_network, create_mode, &token, &metadata_uri).await?;
+                let (buy_sol, hold_secs) = if launch_network == "1" {
+                    match (decision.buy_amount_sol, decision.sell_after_seconds) {
+                        (Some(requested_buy_sol), Some(requested_hold_secs)) => {
+                            if !requested_buy_sol.is_finite() || requested_buy_sol <= 0.0 {
+                                eprintln!(
+                                    "Devnet auto-buy skipped: AI returned an invalid buy amount."
+                                );
+                                (None, None)
+                            } else {
+                                match devnet_wallet_balance_sol(wallet).await {
+                                    Ok(balance) => {
+                                        match bounded_devnet_buy_amount(
+                                            requested_buy_sol,
+                                            balance,
+                                            settings.max_buy_sol,
+                                        ) {
+                                            Some(buy_sol) => (
+                                                Some(buy_sol),
+                                                Some(bounded_hold_secs(
+                                                    requested_hold_secs,
+                                                    settings.max_hold_secs,
+                                                )),
+                                            ),
+                                            None => {
+                                                eprintln!(
+                                                "Devnet auto-buy skipped: only {balance:.9} SOL is available after the required reserve."
+                                            );
+                                                (None, None)
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "Could not read Devnet wallet balance; auto-buy will be unavailable: {error:#}"
+                                        );
+                                        (None, None)
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!(
+                                "Devnet auto-buy skipped: AI did not provide both a buy amount and sell delay."
+                            );
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
+                let (mint, buy_result) = launch_saved_token(
+                    wallet,
+                    launch_network,
+                    create_mode,
+                    &token,
+                    &metadata_uri,
+                    buy_sol,
+                )
+                .await?;
                 state.launched_ids.insert(token_id);
                 state.successful_launches_today += 1;
                 persist_daily_launch_count(state)?;
+                if let Some(buy_result) = buy_result {
+                    let hold_secs = hold_secs.unwrap_or(1);
+                    let failed = buy_result.is_err();
+                    let buy_message = match buy_result {
+                        Ok(signature) => {
+                            println!(
+                                "✅ Devnet auto-buy confirmed: {:.6} SOL for {} (signature: {}).",
+                                buy_sol.unwrap_or_default(),
+                                mint,
+                                signature
+                            );
+                            format!(
+                                "✅ Devnet buy confirmed\nMint: {mint}\nAmount: {:.6} SOL\nTransaction: https://explorer.solana.com/tx/{signature}?cluster=devnet",
+                                buy_sol.unwrap_or_default()
+                            )
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "⚠️  Devnet auto-buy failed for {mint}: {error}. A persisted balance check will still run at the planned exit time."
+                            );
+                            format!(
+                                "⚠️ Devnet buy failed\nMint: {mint}\nError: {}",
+                                truncate_message(&error, 1200)
+                            )
+                        }
+                    };
+                    send_trade_notification(telegram, &buy_message).await;
+                    state.pending_sells.push(PendingSell {
+                        mint: mint.clone(),
+                        due_at_unix_secs: unix_time_secs()
+                            .saturating_add(hold_secs)
+                            .saturating_add(if failed { 120 } else { 0 }),
+                        retry_attempts: 0,
+                    });
+                    persist_pending_sells(
+                        &state.pending_sells,
+                        &state_file_path(AUTO_SELL_STATE_FILE, state.state_id.as_deref()),
+                    )?;
+                }
                 if let Some(telegram) = telegram {
                     let network = if launch_network == "1" {
                         "devnet"
@@ -511,9 +736,24 @@ async fn run_turn(
 async fn request_decision(
     gemini_api_key: &str,
     groq_api_key: Option<&str>,
+    wallet: &Keypair,
+    settings: &AgentSettings,
     launch_network: &str,
     state: &AgentState,
 ) -> Result<ModelDecision> {
+    let wallet_balance_sol = if launch_network == "1" {
+        match devnet_wallet_balance_sol(wallet).await {
+            Ok(balance) => Some(balance),
+            Err(error) => {
+                eprintln!(
+                    "Could not read Devnet wallet balance; auto-buy will be unavailable: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let saved_tokens: Vec<Value> = state
         .tokens
         .list()
@@ -523,6 +763,11 @@ async fn request_decision(
                 "id": token.id,
                 "name": token.name,
                 "symbol": token.symbol,
+                "source_mint": token.source_mint,
+                "source_pair": token.source_pair,
+                "source_pool": token.source_pool,
+                "source_quality": token.source_quality,
+                "source_quality_reason": token.source_quality_reason,
                 "has_image": !token.image.trim().is_empty(),
                 "has_metadata_uri": has_launch_metadata(token, launch_network),
                 "uses_devnet_test_metadata_uri": launch_network == "1"
@@ -538,6 +783,10 @@ async fn request_decision(
         }),
         "current_ingress": state.current_ingress,
         "launch_network": if launch_network == "1" { "devnet" } else { "mainnet" },
+        "devnet_wallet_balance_sol": wallet_balance_sol,
+        "devnet_max_buy_sol": settings.max_buy_sol,
+        "devnet_reserved_sol": DEVNET_SOL_RESERVE,
+        "max_auto_sell_hold_seconds": settings.max_hold_secs.min(MAX_HOLD_SECS),
         "saved_tokens": saved_tokens,
         "latest_x_inspiration_search_result": state.latest_x_result,
         "token_name_x_research_result": state.latest_token_research,
@@ -550,13 +799,13 @@ async fn request_decision(
     });
     let system = r#"You are the action selector for a Solana token-launch assistant.
 Select exactly one action for the current context and return only a JSON object:
-{"action":"pause_ingress|resume_ingress|save_ingress|search_x|launch_create|launch_create2","reason":"brief user-facing explanation of the choice","query":null,"token_id":null,"token_quality":null,"token_quality_reason":null,"suggested_symbol":null,"suggested_narrative":null}
+{"action":"pause_ingress|resume_ingress|save_ingress|search_x|launch_create|launch_create2","reason":"brief user-facing explanation of the choice","query":null,"token_id":null,"token_quality":null,"token_quality_reason":null,"suggested_symbol":null,"suggested_narrative":null,"buy_amount_sol":null,"sell_after_seconds":null}
 
 Rules:
 - Always give a concise, user-facing reason based on the supplied context. Do not provide private chain-of-thought; give only a short decision summary.
 - Ingress normally remains active while you work. You may pause it briefly when pausing helps with an immediate launch or other important action.
 - A pause is temporary and is automatically resumed within 45 seconds. Choose resume_ingress to restart sooner when ready; do not leave ingress paused while idle.
-- A saved token's token_quality is not provided. Never infer or describe the quality of a saved token from current_ingress; its quality assessment applies only to current_ingress.
+- Assess a launch candidate only from its own source_pair, source_pool, and saved source_quality fields. Never use current_ingress metrics to rate a different saved token.
 - On Devnet, a saved token with no metadata URI is launchable using the configured shared test URI; the context marks this with uses_devnet_test_metadata_uri=true. Do not reject it for lacking a URI.
 - On Mainnet, launch only a saved token with a real metadata JSON URI; never invent a URI or substitute an image URL.
 - Launching eligible saved tokens is the top priority: when any unlaunched saved token has has_metadata_uri=true and the daily maximum has not been reached, launch one before searching X, saving a new ingress, or pausing ingress.
@@ -579,6 +828,8 @@ Rules:
 - Select the saved token id in token_id when launching.
 - Do not select a token already marked already_launched.
 - A create action submits a real transaction using the configured wallet. Choose it only when the context supports launching now.
+- Automatic swaps are Devnet-only. For a Devnet launch action, use devnet_wallet_balance_sol to choose buy_amount_sol based on that saved token's prospect; never exceed min(devnet_max_buy_sol, balance minus devnet_reserved_sol). Also choose sell_after_seconds based on the prospect, from 1 second through max_auto_sell_hold_seconds. Always return both values for a Devnet launch when balance allows at least 0.001 SOL to buy; otherwise return both as null. Use shorter holds for weak prospects and longer holds, potentially hours, only when the evidence supports it. For Mainnet, always return both as null; the application does not auto-trade Mainnet.
+- The application independently enforces the 0.03 SOL buy ceiling, wallet reserve, Devnet-only trading, and 24-hour maximum hold. Never suggest larger values.
 - Keep choosing useful actions: save a suitable current ingress, search_x when narrative inspiration is useful, or launch a saved token when justified. Never invent token fields, search results, balances, or metadata URIs."#;
 
     let content = generate_json_text(
@@ -616,23 +867,172 @@ fn utc_day_number() -> u64 {
         / 86_400
 }
 
-fn load_daily_launch_count() -> Result<(u64, u32)> {
+fn state_file_path(filename: &str, state_id: Option<&str>) -> String {
+    match state_id {
+        Some(state_id) => format!(".{state_id}-{}", filename.trim_start_matches('.')),
+        None => filename.to_string(),
+    }
+}
+
+fn load_daily_launch_count(path: &str) -> Result<(u64, u32)> {
     let today = utc_day_number();
-    let contents = match std::fs::read_to_string(DAILY_LAUNCH_STATE_FILE) {
+    let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((today, 0)),
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!("failed to read daily launch counter from {DAILY_LAUNCH_STATE_FILE}")
-            })
+            return Err(error)
+                .with_context(|| format!("failed to read daily launch counter from {path}"))
         }
     };
     let saved: DailyLaunchCount = serde_json::from_str(&contents)
-        .with_context(|| format!("invalid daily launch counter in {DAILY_LAUNCH_STATE_FILE}"))?;
+        .with_context(|| format!("invalid daily launch counter in {path}"))?;
     if saved.utc_day == today {
         Ok((saved.utc_day, saved.successful_launches))
     } else {
         Ok((today, 0))
+    }
+}
+
+fn load_pending_sells(path: &str) -> Result<Vec<PendingSell>> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read auto-sell state from {path}"))
+        }
+    };
+    serde_json::from_str(&contents).with_context(|| format!("invalid auto-sell state in {path}"))
+}
+
+fn persist_pending_sells(pending_sells: &[PendingSell], path: &str) -> Result<()> {
+    let temporary_path = format!("{path}.tmp");
+    let contents = serde_json::to_vec(pending_sells)?;
+    std::fs::write(&temporary_path, contents)
+        .with_context(|| format!("failed to write auto-sell state to {temporary_path}"))?;
+    std::fs::rename(&temporary_path, path)
+        .with_context(|| format!("failed to replace auto-sell state at {path}"))
+}
+
+fn unix_time_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn bounded_devnet_buy_amount(requested: f64, balance: f64, configured_max: f64) -> Option<f64> {
+    if !requested.is_finite() || requested <= 0.0 || !balance.is_finite() {
+        return None;
+    }
+    let maximum = DEVNET_MAX_BUY_SOL
+        .min(configured_max)
+        .min((balance - DEVNET_SOL_RESERVE).max(0.0));
+    let amount = requested.min(maximum);
+    (amount >= 0.001).then_some(amount)
+}
+
+fn bounded_hold_secs(requested: u64, configured_max: u64) -> u64 {
+    requested.clamp(1, configured_max.clamp(1, MAX_HOLD_SECS))
+}
+
+fn next_auto_sell_due(pending_sells: &[PendingSell]) -> Option<u64> {
+    pending_sells
+        .iter()
+        .map(|pending| pending.due_at_unix_secs)
+        .min()
+}
+
+async fn wait_until_auto_sell_due(due_at_unix_secs: Option<u64>) {
+    match due_at_unix_secs {
+        Some(deadline) => {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                deadline.saturating_sub(unix_time_secs()),
+            ))
+            .await
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn process_due_auto_sells(
+    wallet: &Keypair,
+    state: &mut AgentState,
+    telegram: Option<&TelegramNotifier>,
+) -> Result<()> {
+    let now = unix_time_secs();
+    let mut pending = Vec::new();
+    for mut position in state.pending_sells.drain(..) {
+        if position.due_at_unix_secs > now {
+            pending.push(position);
+            continue;
+        }
+
+        match sell_all_devnet_tokens(wallet, &position.mint).await {
+            Ok(Some(signature)) => {
+                println!(
+                    "✅ Devnet auto-sell confirmed for {} (signature: {}).",
+                    position.mint, signature
+                );
+                let message = format!(
+                    "✅ Devnet sell confirmed\nMint: {}\nTransaction: https://explorer.solana.com/tx/{signature}?cluster=devnet",
+                    position.mint
+                );
+                send_trade_notification(telegram, &message).await;
+            }
+            Ok(None) => {
+                println!(
+                    "Devnet auto-sell found no remaining token balance for {}; clearing its schedule.",
+                    position.mint
+                );
+                let message = format!(
+                    "ℹ️ Devnet sell skipped: no token balance remains\nMint: {}",
+                    position.mint
+                );
+                send_trade_notification(telegram, &message).await;
+            }
+            Err(error) => {
+                position.retry_attempts = position.retry_attempts.saturating_add(1);
+                let retry_delay = AUTO_SELL_RETRY_SECS
+                    .saturating_mul(1_u64 << position.retry_attempts.min(4))
+                    .min(300);
+                position.due_at_unix_secs = now.saturating_add(retry_delay);
+                eprintln!(
+                    "⚠️  Devnet auto-sell failed for {}: {error:#}. Retrying in {retry_delay} seconds.",
+                    position.mint
+                );
+                let message = format!(
+                    "⚠️ Devnet sell failed; retry scheduled in {retry_delay} seconds\nMint: {}\nError: {}",
+                    position.mint,
+                    truncate_message(&format!("{error:#}"), 1200)
+                );
+                send_trade_notification(telegram, &message).await;
+                pending.push(position);
+            }
+        }
+    }
+    state.pending_sells = pending;
+    persist_pending_sells(
+        &state.pending_sells,
+        &state_file_path(AUTO_SELL_STATE_FILE, state.state_id.as_deref()),
+    )
+}
+
+async fn send_trade_notification(telegram: Option<&TelegramNotifier>, message: &str) {
+    if let Some(telegram) = telegram {
+        if let Err(error) = telegram.send_message(message).await {
+            eprintln!("Telegram trade notification failed: {error:#}");
+        }
+    }
+}
+
+fn truncate_message(message: &str, max_chars: usize) -> String {
+    let mut chars = message.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
     }
 }
 
@@ -641,9 +1041,9 @@ fn persist_daily_launch_count(state: &AgentState) -> Result<()> {
         utc_day: state.launch_day,
         successful_launches: state.successful_launches_today,
     };
-    std::fs::write(DAILY_LAUNCH_STATE_FILE, serde_json::to_vec(&count)?).with_context(|| {
-        format!("failed to save daily launch counter to {DAILY_LAUNCH_STATE_FILE}")
-    })
+    let path = state_file_path(DAILY_LAUNCH_STATE_FILE, state.state_id.as_deref());
+    std::fs::write(&path, serde_json::to_vec(&count)?)
+        .with_context(|| format!("failed to save daily launch counter to {path}"))
 }
 
 fn refresh_daily_launch_count(state: &mut AgentState) {
@@ -828,15 +1228,19 @@ fn is_metadata_uri(uri: &str) -> bool {
 }
 
 async fn launch_saved_token(
+    wallet: &Keypair,
     network_choice: &str,
     create_mode: &str,
     token: &TokenRecord,
     metadata_uri: &str,
-) -> Result<String> {
+    buy_amount_sol: Option<f64>,
+) -> Result<(String, Option<std::result::Result<String, String>>)> {
     create_token_flow(
+        wallet,
         network_choice,
         create_mode,
         [&token.name, &token.symbol, metadata_uri, "", ""],
+        buy_amount_sol,
     )
     .await
 }
@@ -947,6 +1351,10 @@ mod tests {
             symbol: "EX".to_string(),
             image: "https://example.com/image.png".to_string(),
             metadata_uri: String::new(),
+            source_pair: None,
+            source_pool: None,
+            source_quality: None,
+            source_quality_reason: None,
         };
         assert_eq!(
             launch_metadata_uri(&token, "1").unwrap(),
